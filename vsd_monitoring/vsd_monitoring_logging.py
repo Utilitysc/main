@@ -1,5 +1,3 @@
-#sudah bisa baca temp, freq , current dengan normal
-
 import asyncio
 from pymodbus.client import AsyncModbusTcpClient
 from pymodbus.exceptions import ModbusException
@@ -27,7 +25,7 @@ DATABASE_NAME = os.path.join(SCRIPT_DIR, "vsd_read.db")
 
 def initialize_database():
     """
-    Initialize the SQLite database with separate tables for temperature, current, and frequency readings.
+    Initialize the SQLite database with separate tables for temperature, current, frequency, and status readings.
     """
     conn = sqlite3.connect(DATABASE_NAME)
     cursor = conn.cursor()
@@ -64,6 +62,18 @@ def initialize_database():
             {freq_columns}
         )
     """)
+
+    # Create status tables
+    for table in ["vsd_run", "vsd_fault", "vsd_alarm"]:
+        status_columns = ", ".join([f"{name} TEXT" for name in VSD_NAMES.values()])
+        cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS {table} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                time TEXT NOT NULL,
+                {status_columns}
+            )
+        """)
 
     conn.commit()
     conn.close()
@@ -127,6 +137,33 @@ async def read_vsd_data_batch(client, unit_id, start_register, count, scaling_fa
         print(f"{VSD_NAMES[unit_id]}: Exception - {e}")
         return [None] * count
 
+async def read_vsd_status(client, unit_id, start_register):
+    """
+    Reads a coil register for the status (RUN/STOP) using discrete inputs.
+    """
+    try:
+        address = start_register - 10001  # Adjust for zero-based addressing
+        response = await client.read_discrete_inputs(address=address, count=8, slave=unit_id)
+
+        if not response.isError():
+            # Extract bit 2, 3, and 7 (0-based indexing)
+            bit_2 = response.bits[2]
+            bit_3 = response.bits[3]
+            bit_7 = response.bits[7]
+
+            # Return status as 'RUN' or 'STOP'
+            return ["RUN" if bit_2 else "STOP", "FAULT" if bit_3 else "NORMAL", "ALARM" if bit_7 else "NORMAL"]
+        else:
+            print(f"Error reading discrete inputs from unit {unit_id}: {response}")
+            return [None, None, None]
+
+    except ModbusException as e:
+        print(f"ModbusException while reading status from unit {unit_id}: {e}")
+        return [None, None, None]
+    except Exception as e:
+        print(f"Exception while reading status from unit {unit_id}: {e}")
+        return [None, None, None]
+
 async def main():
     # Initialize the database
     initialize_database()
@@ -138,6 +175,7 @@ async def main():
         temp_headers = ["Date", "Time"] + list(VSD_NAMES.values())
         current_headers = ["Date", "Time"] + [f"Current_{name}" for name in VSD_NAMES.values()]
         freq_headers = ["Date", "Time"] + [f"Freq_{name}" for name in VSD_NAMES.values()]
+        status_headers = ["Date", "Time"] + [f"Status_{name}" for name in VSD_NAMES.values()]
 
         while True:
             # Record current date and time
@@ -149,45 +187,63 @@ async def main():
             temperatures = []
             currents = []
             frequencies = []
+            run_status = []
+            fault_status = []
+            alarm_status = []
 
             for unit_id in range(1, TOTAL_UNITS + 1):
-                # Read registers 40103 to 40110 in one batch
+                # Read temperature, current, and frequency
                 values = await read_vsd_data_batch(
                     client, unit_id, 40103, count=8,
                     scaling_factors=[10, 10, 10, 10, 10, 10, 10, 10],
                     valid_ranges=[(0, 50), (0, 200), (-50, 100)] + [(-50, 100)] * 5
                 )
 
-                # Assign specific registers to variables
                 frequency, current, temperature = values[0], values[1], values[7]
 
                 frequencies.append(frequency)
                 currents.append(current)
                 temperatures.append(temperature)
 
-            # Save temperature readings to database
+                # Read status
+                status = await read_vsd_status(client, unit_id, start_register=10001)
+                run_status.append(status[0])
+                fault_status.append(status[1])
+                alarm_status.append(status[2])
+
+            # Save readings to database
             save_to_database("vsd_temp", date, time_str, temperatures)
-
-            # Save current readings to database
             save_to_database("vsd_current", date, time_str, currents)
-
-            # Save frequency readings to database
             save_to_database("vsd_freq", date, time_str, frequencies)
+            save_to_database("vsd_run", date, time_str, run_status)
+            save_to_database("vsd_fault", date, time_str, fault_status)
+            save_to_database("vsd_alarm", date, time_str, alarm_status)
 
-            # Display temperature readings
+            # Display readings
             temp_row = [date, time_str] + temperatures
+            current_row = [date, time_str] + currents
+            freq_row = [date, time_str] + frequencies
+            run_row = [date, time_str] + run_status
+            fault_row = [date, time_str] + fault_status
+            alarm_row = [date, time_str] + alarm_status
+
             print("\nTemperature Readings:")
             print(tabulate([temp_row], headers=temp_headers, tablefmt="grid"))
 
-            # Display current readings
-            current_row = [date, time_str] + currents
             print("\nCurrent Readings:")
             print(tabulate([current_row], headers=current_headers, tablefmt="grid"))
 
-            # Display frequency readings
-            freq_row = [date, time_str] + frequencies
             print("\nFrequency Readings:")
             print(tabulate([freq_row], headers=freq_headers, tablefmt="grid"))
+
+            print("\nRUN Status:")
+            print(tabulate([run_row], headers=status_headers, tablefmt="grid"))
+
+            print("\nFAULT Status:")
+            print(tabulate([fault_row], headers=status_headers, tablefmt="grid"))
+
+            print("\nALARM Status:")
+            print(tabulate([alarm_row], headers=status_headers, tablefmt="grid"))
 
             # Wait for the next cycle
             print("All units read. Waiting for the next interval...")
